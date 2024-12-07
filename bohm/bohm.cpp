@@ -170,13 +170,16 @@ void cc_worker(int thread_id, const bool& start, const bool& quit) {
         // Process each transaction in the CC phase
         for (auto& trans : local_batch) {
             for (const auto& task : trans.task_set_) {
-                if (task.ope_ == Ope::WRITE) {
+                // Only process write operations for keys in the thread's partition
+                if (task.ope_ == Ope::WRITE &&
+                    std::find(thread_partitions[thread_id].begin(),
+                              thread_partitions[thread_id].end(),
+                              task.key_) != thread_partitions[thread_id].end()) {
                     Table[task.key_].addPlaceholder(trans.timestamp_);
                     trans.write_set_.emplace_back(task.key_);
                 }
             }
-
-            // Push the transaction to the ready queue
+            // Add the transaction to the ready queue
             {
                 std::lock_guard<std::mutex> lock(partition_mutex);
                 ready_queue.push_back(trans);
