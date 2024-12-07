@@ -8,15 +8,16 @@
 #include <algorithm>
 #include <unordered_map>
 #include <mutex>
+#include <condition_variable>
 
-#define PAGE_SIZE 4096        // Memory page size
-#define THREAD_NUM 64         // Number of worker threads
-#define TUPLE_NUM 1000000     // Number of database records
-#define MAX_OPE 10            // Maximum number of operations per transaction
-#define EX_TIME 3             // Execution time in seconds
-#define BATCH_SIZE 1000       // Batch size for processing transactions
+#define PAGE_SIZE 4096
+#define THREAD_NUM 64        // Number of threads
+#define TUPLE_NUM 1000000    // Number of records
+#define MAX_OPE 10           // Maximum operations per transaction
+#define EX_TIME 3            // Execution time in seconds
+#define BATCH_SIZE 1000      // Batch size for processing transactions
 
-uint64_t tx_counter = 0;      // Global transaction counter
+uint64_t tx_counter = 0;     // Global transaction counter
 
 class Result {
 public:
@@ -29,8 +30,8 @@ enum class Ope { READ, WRITE };
 
 class Task {
 public:
-    Ope ope_;      // Operation type (READ or WRITE)
-    uint64_t key_; // Key associated with the operation
+    Ope ope_;
+    uint64_t key_;
 
     Task(Ope ope, uint64_t key) : ope_(ope), key_(key) {}
 };
@@ -45,7 +46,8 @@ public:
         Version* prev_pointer_;
 
         Version(uint64_t begin, uint64_t end, uint64_t value, bool placeholder, Version* prev)
-            : begin_timestamp_(begin), end_timestamp_(end), value_(value), placeholder_(placeholder), prev_pointer_(prev) {}
+            : begin_timestamp_(begin), end_timestamp_(end), value_(value),
+              placeholder_(placeholder), prev_pointer_(prev) {}
     };
 
     Version* latest_version_;
@@ -87,7 +89,7 @@ public:
     }
 };
 
-Tuple *Table;
+Tuple* Table;
 
 enum class Status { UNPROCESSED, EXECUTING, COMMITTED };
 
@@ -104,7 +106,7 @@ public:
 
     Transaction()
         : timestamp_(0), status_(Status::UNPROCESSED) {}
-    
+
     void startExecution() {
         status_ = Status::EXECUTING;
     }
@@ -129,10 +131,11 @@ void assignRecordsToThreads() {
 std::vector<Transaction> transactions(TUPLE_NUM);
 std::vector<Transaction> ready_queue;
 std::mutex partition_mutex;
+std::condition_variable ready_queue_cv;
 
 // Initializes the database table
 void makeDB() {
-    posix_memalign((void **)&Table, PAGE_SIZE, TUPLE_NUM * sizeof(Tuple));
+    posix_memalign((void**)&Table, PAGE_SIZE, TUPLE_NUM * sizeof(Tuple));
     for (int i = 0; i < TUPLE_NUM; i++) {
         Table[i] = Tuple();
     }
@@ -150,7 +153,7 @@ void initializeTransactions() {
 }
 
 // CC phase worker function
-void cc_worker(int thread_id, const bool &start, const bool &quit) {
+void cc_worker(int thread_id, const bool& start, const bool& quit) {
     while (!__atomic_load_n(&start, __ATOMIC_SEQ_CST)) {}
 
     while (!__atomic_load_n(&quit, __ATOMIC_SEQ_CST)) {
@@ -165,8 +168,8 @@ void cc_worker(int thread_id, const bool &start, const bool &quit) {
         }
 
         // Process each transaction in the CC phase
-        for (auto &trans : local_batch) {
-            for (const auto &task : trans.task_set_) {
+        for (auto& trans : local_batch) {
+            for (const auto& task : trans.task_set_) {
                 if (task.ope_ == Ope::WRITE) {
                     Table[task.key_].addPlaceholder(trans.timestamp_);
                     trans.write_set_.emplace_back(task.key_);
@@ -179,11 +182,12 @@ void cc_worker(int thread_id, const bool &start, const bool &quit) {
                 ready_queue.push_back(trans);
             }
         }
+        ready_queue_cv.notify_all(); // Notify Execution Workers
     }
 }
 
 // Execution phase worker function
-void execution_worker(int thread_id, const bool &start, const bool &quit) {
+void execution_worker(int thread_id, const bool& start, const bool& quit) {
     while (!__atomic_load_n(&start, __ATOMIC_SEQ_CST)) {}
 
     while (!__atomic_load_n(&quit, __ATOMIC_SEQ_CST)) {
@@ -191,31 +195,31 @@ void execution_worker(int thread_id, const bool &start, const bool &quit) {
 
         // Retrieve transactions from the ready queue
         {
-            std::lock_guard<std::mutex> lock(partition_mutex);
-            if (ready_queue.empty()) continue;
+            std::unique_lock<std::mutex> lock(partition_mutex);
+            ready_queue_cv.wait(lock, [] { return !ready_queue.empty(); });
             local_batch.swap(ready_queue);
         }
 
         // Process each transaction in the execution phase
-        for (auto &trans : local_batch) {
+        for (auto& trans : local_batch) {
             if (trans.status_ == Status::UNPROCESSED) {
                 trans.startExecution();
 
                 // Execute READ operations
-                for (const auto &task : trans.task_set_) {
+                for (const auto& task : trans.task_set_) {
                     if (task.ope_ == Ope::READ) {
                         auto value = Table[task.key_].getVersion(trans.timestamp_);
                         if (value.has_value()) {
                             trans.read_set_.emplace_back(task.key_, value.value());
                         } else {
-                            std::cerr << "Error: Missing version during execution. Key: " << task.key_ << "\n";
+                            std::cerr << "Execution Worker " << thread_id << ": Missing version for key: " << task.key_ << "\n";
                             return;
                         }
                     }
                 }
 
                 // Execute WRITE operations
-                for (const auto &key : trans.write_set_) {
+                for (const auto& key : trans.write_set_) {
                     Table[key].updatePlaceholder(trans.timestamp_, 100);
                 }
 
@@ -250,11 +254,11 @@ int main() {
     std::this_thread::sleep_for(std::chrono::seconds(EX_TIME));
     __atomic_store_n(&quit, true, __ATOMIC_SEQ_CST);
 
-    for (auto &worker : cc_workers) worker.join();
-    for (auto &worker : execution_workers) worker.join();
+    for (auto& worker : cc_workers) worker.join();
+    for (auto& worker : execution_workers) worker.join();
 
     uint64_t total_commits = 0;
-    for (const auto &result : AllResult) {
+    for (const auto& result : AllResult) {
         total_commits += result.commit_cnt_;
     }
 
