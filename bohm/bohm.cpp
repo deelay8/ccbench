@@ -8,11 +8,11 @@
 #include <algorithm>
 
 #define PAGE_SIZE 4096
-#define THREAD_NUM 64        // 스레드 개수
-#define TUPLE_NUM 1000000    // 레코드 수
-#define MAX_OPE 10           // 트랜잭션당 최대 작업 수
-#define EX_TIME 3            // 실행 시간 (초)
-#define BATCH_SIZE 1000      // 한 번에 처리할 트랜잭션 수
+#define THREAD_NUM 64        // Number of threads
+#define TUPLE_NUM 1000000    // Number of records
+#define MAX_OPE 10           // Maximum number of operations per transaction
+#define EX_TIME 3            // Execution time (seconds)
+#define BATCH_SIZE 1000      // Number of transactions processed in one batch
 
 uint64_t tx_counter = 0;
 
@@ -33,40 +33,40 @@ public:
     Task(Ope ope, uint64_t key) : ope_(ope), key_(key) {}
 };
 
-// 버전 관리 클래스
+// Version management class
 class Tuple {
 public:
     struct Version {
-        uint64_t begin_timestamp_;  // 버전 유효 시작 시간
-        uint64_t end_timestamp_;    // 버전 유효 종료 시간
-        uint64_t value_;            // 값
-        bool placeholder_;          // Placeholder 여부
-        Version* prev_pointer_;     // 이전 버전에 대한 포인터
+        uint64_t begin_timestamp_;  // Version valid start time
+        uint64_t end_timestamp_;    // Version valid end time
+        uint64_t value_;            // Value
+        bool placeholder_;          // Placeholder flag
+        Version* prev_pointer_;     // Pointer to the previous version
 
         Version(uint64_t begin, uint64_t end, uint64_t value, bool placeholder, Version* prev)
             : begin_timestamp_(begin), end_timestamp_(end), value_(value), placeholder_(placeholder), prev_pointer_(prev) {}
     };
 
-    Version* latest_version_; // 가장 최신 버전에 대한 포인터
+    Version* latest_version_; // Pointer to the latest version
 
     Tuple() {
         latest_version_ = new Version(0, UINT64_MAX, 0, false, nullptr);
     }
 
-    // Placeholder 추가 (쓰기 작업 시 호출)
+    // Add a placeholder (called during write operations)
     void addPlaceholder(uint64_t timestamp) {
         auto new_version = new Version(timestamp, UINT64_MAX, 0, true, latest_version_);
 
-        // 이전 버전의 종료 타임스탬프 설정
+        // Set the end timestamp of the previous version
         if (latest_version_) {
             latest_version_->end_timestamp_ = timestamp;
         }
 
-        // 최신 버전을 업데이트
+        // Update the latest version
         latest_version_ = new_version;
     }
 
-    // Placeholder를 실제 값으로 업데이트
+    // Update a placeholder with an actual value
     bool updatePlaceholder(uint64_t timestamp, uint64_t value) {
         Version* version = latest_version_;
         while (version) {
@@ -77,10 +77,10 @@ public:
             }
             version = version->prev_pointer_;
         }
-        return false; // 해당 Placeholder를 찾지 못함
+        return false; // Placeholder not found
     }
 
-    // 특정 타임스탬프에 유효한 버전 가져오기
+    // Get the version valid at a specific timestamp
     std::optional<uint64_t> getVersion(uint64_t timestamp) {
         Version* version = latest_version_;
         while (version) {
@@ -89,7 +89,7 @@ public:
             }
             version = version->prev_pointer_;
         }
-        return std::nullopt; // 유효한 버전이 없음
+        return std::nullopt; // No valid version found
     }
 };
 
@@ -97,7 +97,7 @@ Tuple *Table;
 
 enum class Status { UNPROCESSED, EXECUTING, COMMITTED };
 
-// 트랜잭션 정의
+// Transaction definition
 class Transaction {
 public:
     uint64_t timestamp_;
@@ -120,7 +120,7 @@ public:
     }
 };
 
-// 정적 파티셔닝
+// Static partitioning
 std::vector<std::vector<uint64_t>> thread_partitions(THREAD_NUM);
 
 void assignRecordsToThreads() {
@@ -130,7 +130,7 @@ void assignRecordsToThreads() {
     }
 }
 
-// DB 초기화
+// Initialize the database
 void makeDB() {
     posix_memalign((void **)&Table, PAGE_SIZE, TUPLE_NUM * sizeof(Tuple));
     for (int i = 0; i < TUPLE_NUM; i++) {
@@ -155,7 +155,7 @@ void concurrencyControlPhase(Transaction &trans, int thread_id) {
 void executeTransaction(Transaction &trans) {
     trans.startExecution();
 
-    // Read 작업 수행
+    // read operations
     for (const auto &task : trans.task_set_) {
         if (task.ope_ == Ope::READ) {
             auto value = Table[task.key_].getVersion(trans.timestamp_);
@@ -168,7 +168,7 @@ void executeTransaction(Transaction &trans) {
         }
     }
 
-    // Write 작업 수행
+    // write operations
     for (const auto &key : trans.write_set_) {
         Table[key].updatePlaceholder(trans.timestamp_, 100); // 예제 값 100
     }
@@ -176,7 +176,7 @@ void executeTransaction(Transaction &trans) {
     trans.commit();
 }
 
-// 배치 처리
+// Batch processing
 void processBatch(std::vector<Transaction> &batch, int thread_id) {
     for (auto &trans : batch) {
         if (trans.status_ == Status::UNPROCESSED) {
@@ -191,7 +191,7 @@ void processBatch(std::vector<Transaction> &batch, int thread_id) {
     }
 }
 
-// 스레드 작업
+// Thread task
 void worker(int thread_id, int &ready, const bool &start, const bool &quit) {
     Result &myres = AllResult[thread_id];
     std::vector<Transaction> batch;
