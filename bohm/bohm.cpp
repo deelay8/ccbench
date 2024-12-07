@@ -100,24 +100,28 @@ Tuple *Table; // Pointer to the database table (array of tuples)
 // Enumeration to represent the status of a transaction
 enum class Status { UNPROCESSED, EXECUTING, COMMITTED };
 
-// Transaction class represents a single database transaction
 class Transaction {
 public:
-    uint64_t timestamp_; // Timestamp assigned to the transaction
-    Status status_;      // Current status of the transaction
-    std::vector<Task> task_set_;              // Set of tasks (operations) in the transaction
-    std::vector<std::pair<uint64_t, uint64_t>> read_set_; // Set of read operations
-    std::vector<uint64_t> write_set_;         // Set of write operations
+    uint64_t timestamp_; // Transaction timestamp
+    Status status_;      // Transaction status
+    std::vector<Task> task_set_;              // List of tasks (operations)
+    std::vector<std::pair<uint64_t, uint64_t>> read_set_; // Read set
+    std::vector<uint64_t> write_set_;         // Write set
 
+    // Parameterized constructor
     Transaction(uint64_t timestamp)
         : timestamp_(timestamp), status_(Status::UNPROCESSED) {}
 
-    // Marks the transaction as executing
+    // Default constructor (needed for std::vector<Transaction>)
+    Transaction()
+        : timestamp_(0), status_(Status::UNPROCESSED) {}
+    
+    // Method to mark the transaction as executing
     void startExecution() {
         status_ = Status::EXECUTING;
     }
 
-    // Commits the transaction and clears its read/write sets
+    // Method to commit the transaction
     void commit() {
         read_set_.clear();
         write_set_.clear();
