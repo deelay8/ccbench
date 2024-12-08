@@ -9,22 +9,25 @@
 #include <unordered_map>
 #include <mutex>
 #include <condition_variable>
+#include <queue>
+#include <functional> 
 
 #define PAGE_SIZE 4096
-#define THREAD_NUM 64        // Number of threads
-#define TUPLE_NUM 1000000    // Number of records
-#define MAX_OPE 10           // Maximum operations per transaction
-#define EX_TIME 3            // Execution time in seconds
-#define BATCH_SIZE 1000      // Batch size for processing transactions
+#define DEFAULT_THREAD_NUM 8       // Default number of threads for debugging
+#define DEFAULT_TUPLE_NUM 1000     // Default number of records for debugging
+#define MAX_OPE 10                 // Maximum operations per transaction
+#define EX_TIME 3                  // Execution time in seconds
+#define BATCH_SIZE 50              // Reduced batch size for debugging
+#define MAX_RETRY 10              // Max retries for failed transactions
 
-uint64_t tx_counter = 0;     // Global transaction counter
+uint64_t tx_counter = 0;           // Global transaction counter
 
 class Result {
 public:
     uint64_t commit_cnt_ = 0; // Count of committed transactions
 };
 
-std::vector<Result> AllResult(THREAD_NUM);
+std::vector<Result> AllResult;
 
 enum class Ope { READ, WRITE };
 
@@ -119,35 +122,53 @@ public:
 };
 
 // Static partitioning: Each thread owns a set of records
-std::vector<std::vector<uint64_t>> thread_partitions(THREAD_NUM);
+std::vector<std::vector<uint64_t>> thread_partitions;
 
-void assignRecordsToThreads() {
-    for (uint64_t i = 0; i < TUPLE_NUM; ++i) {
-        int thread_id = i % THREAD_NUM;
+// Assigns records only to CC phase threads
+void assignRecordsToCCThreads(size_t cc_thread_num, size_t tuple_num) {
+    thread_partitions.resize(cc_thread_num);
+    for (uint64_t i = 0; i < tuple_num; ++i) {
+        int thread_id = i % cc_thread_num;
         thread_partitions[thread_id].push_back(i);
     }
 }
 
-std::vector<Transaction> transactions(TUPLE_NUM);
-std::vector<Transaction> ready_queue;
+// Debugging function to display record distribution
+void debugRecordDistribution(size_t cc_thread_num) {
+    for (size_t thread_id = 0; thread_id < cc_thread_num; ++thread_id) {
+        std::cout << "[DEBUG] CC Thread " << thread_id << " assigned records: ";
+        for (const auto& record : thread_partitions[thread_id]) {
+            std::cout << record << " ";
+        }
+        std::cout << std::endl;
+    }
+}
+
+std::vector<Transaction> transactions;
+std::priority_queue<Transaction, std::vector<Transaction>, std::function<bool(const Transaction&, const Transaction&)>> ready_queue(
+    [](const Transaction& a, const Transaction& b) {
+        return a.timestamp_ > b.timestamp_; // Prioritize lower timestamps
+    }
+);
 std::mutex partition_mutex;
 std::condition_variable ready_queue_cv;
 
 // Initializes the database table
-void makeDB() {
-    posix_memalign((void**)&Table, PAGE_SIZE, TUPLE_NUM * sizeof(Tuple));
-    for (int i = 0; i < TUPLE_NUM; i++) {
+void makeDB(size_t tuple_num) {
+    posix_memalign((void**)&Table, PAGE_SIZE, tuple_num * sizeof(Tuple));
+    for (size_t i = 0; i < tuple_num; i++) {
         Table[i] = Tuple();
     }
 }
 
 // Initializes all transactions
-void initializeTransactions() {
-    for (uint64_t i = 0; i < TUPLE_NUM; ++i) {
+void initializeTransactions(size_t tuple_num) {
+    transactions.resize(tuple_num);
+    for (uint64_t i = 0; i < tuple_num; ++i) {
         transactions[i] = Transaction(i);
         transactions[i].task_set_ = {
-            Task(Ope::READ, i % TUPLE_NUM),
-            Task(Ope::WRITE, (i + 1) % TUPLE_NUM)
+            Task(Ope::READ, i % tuple_num),
+            Task(Ope::WRITE, (i + 1) % tuple_num)
         };
     }
 }
@@ -159,18 +180,21 @@ void cc_worker(int thread_id, const bool& start, const bool& quit) {
     while (!__atomic_load_n(&quit, __ATOMIC_SEQ_CST)) {
         std::vector<Transaction> local_batch;
 
-        // Collect transactions for this thread's batch
-        for (size_t i = 0; i < BATCH_SIZE; ++i) {
-            uint64_t tx_pos = __atomic_fetch_add(&tx_counter, 1, __ATOMIC_SEQ_CST);
-            if (tx_pos >= TUPLE_NUM) return;
-
-            local_batch.emplace_back(transactions[tx_pos]);
+        // Fetch a batch of transactions
+        uint64_t start_pos = __atomic_fetch_add(&tx_counter, BATCH_SIZE, __ATOMIC_SEQ_CST);
+        uint64_t end_pos = std::min(start_pos + BATCH_SIZE, (uint64_t)transactions.size());
+        for (uint64_t i = start_pos; i < end_pos; ++i) {
+            local_batch.emplace_back(transactions[i]);
         }
+
+        // sort
+        std::sort(local_batch.begin(), local_batch.end(), [](const Transaction& a, const Transaction& b) {
+            return a.timestamp_ < b.timestamp_;
+        });
 
         // Process each transaction in the CC phase
         for (auto& trans : local_batch) {
             for (const auto& task : trans.task_set_) {
-                // Only process write operations for keys in the thread's partition
                 if (task.ope_ == Ope::WRITE &&
                     std::find(thread_partitions[thread_id].begin(),
                               thread_partitions[thread_id].end(),
@@ -179,64 +203,120 @@ void cc_worker(int thread_id, const bool& start, const bool& quit) {
                     trans.write_set_.emplace_back(task.key_);
                 }
             }
-            // Add the transaction to the ready queue
+
+            // Push the transaction to the ready queue
             {
                 std::lock_guard<std::mutex> lock(partition_mutex);
-                ready_queue.push_back(trans);
+                ready_queue.push(trans);
             }
         }
         ready_queue_cv.notify_all(); // Notify Execution Workers
     }
 }
 
-// Execution phase worker function
 void execution_worker(int thread_id, const bool& start, const bool& quit) {
     while (!__atomic_load_n(&start, __ATOMIC_SEQ_CST)) {}
 
     while (!__atomic_load_n(&quit, __ATOMIC_SEQ_CST)) {
         std::vector<Transaction> local_batch;
 
-        // Retrieve transactions from the ready queue
         {
             std::unique_lock<std::mutex> lock(partition_mutex);
-            ready_queue_cv.wait(lock, [] { return !ready_queue.empty(); });
-            local_batch.swap(ready_queue);
+            while (ready_queue.empty() && !quit) {
+                ready_queue_cv.wait(lock);
+            }
+            // Retrieve the transaction with the lowest timestamp from the priority queue
+            while (!ready_queue.empty()) {
+                local_batch.push_back(ready_queue.top());
+                ready_queue.pop();
+            }
         }
 
-        // Process each transaction in the execution phase
         for (auto& trans : local_batch) {
             if (trans.status_ == Status::UNPROCESSED) {
                 trans.startExecution();
+                std::cout << "[DEBUG] Thread " << thread_id << ": Executing transaction " 
+                          << trans.timestamp_ << std::endl;
 
-                // Execute READ operations
-                for (const auto& task : trans.task_set_) {
-                    if (task.ope_ == Ope::READ) {
-                        auto value = Table[task.key_].getVersion(trans.timestamp_);
-                        if (value.has_value()) {
-                            trans.read_set_.emplace_back(task.key_, value.value());
-                        } else {
-                            std::cerr << "Execution Worker " << thread_id << ": Missing version for key: " << task.key_ << "\n";
-                            return;
+                bool success = true;
+                int retry_count = 0;
+
+                do {
+                    success = true;
+                    for (const auto& task : trans.task_set_) {
+                        switch (task.ope_) {
+                        case Ope::READ: {
+                            auto value = Table[task.key_].getVersion(trans.timestamp_);
+                            if (!value.has_value()) {
+                                success = false;
+                                retry_count++;
+                                std::cerr << "[DEBUG] Thread " << thread_id 
+                                          << ": Missing version for key " << task.key_ 
+                                          << " in transaction " << trans.timestamp_ 
+                                          << ", retry count: " << retry_count << std::endl;
+                                std::this_thread::sleep_for(std::chrono::microseconds(10));
+                            } else {
+                                std::cout << "[DEBUG] Thread " << thread_id 
+                                          << ": READ value " << value.value() 
+                                          << " for key " << task.key_ 
+                                          << " in transaction " << trans.timestamp_ << std::endl;
+                            }
+                            break;
                         }
+                        case Ope::WRITE: {
+                            Table[task.key_].updatePlaceholder(trans.timestamp_, 100);
+                            std::cout << "[DEBUG] Thread " << thread_id 
+                                      << ": Updated WRITE placeholder for key " << task.key_ 
+                                      << " in transaction " << trans.timestamp_ << std::endl;
+                            break;
+                        }
+                        default:
+                            std::cerr << "[ERROR] Thread " << thread_id 
+                                      << ": Unknown operation type in transaction " 
+                                      << trans.timestamp_ << std::endl;
+                            success = false; 
+                        }
+                        if (!success) break;
                     }
-                }
+                } while (!success && retry_count < MAX_RETRY);
 
-                // Execute WRITE operations
-                for (const auto& key : trans.write_set_) {
-                    Table[key].updatePlaceholder(trans.timestamp_, 100);
+                if (success) {
+                    trans.commit();
+                    AllResult[thread_id].commit_cnt_++;
+                    std::cout << "[DEBUG] Thread " << thread_id 
+                              << ": Transaction " << trans.timestamp_ 
+                              << " committed successfully after " 
+                              << retry_count << " retries" << std::endl;
+                } else {
+                    std::cerr << "[ERROR] Thread " << thread_id 
+                              << ": Transaction " << trans.timestamp_ 
+                              << " failed after max retries (" 
+                              << retry_count << ")" << std::endl;
                 }
-
-                trans.commit();
-                AllResult[thread_id].commit_cnt_++;
             }
         }
     }
 }
 
-int main() {
-    makeDB();
-    initializeTransactions();
-    assignRecordsToThreads(); // Static partitioning of records
+
+int main(int argc, char* argv[]) {
+    size_t thread_num = DEFAULT_THREAD_NUM;
+    size_t tuple_num = DEFAULT_TUPLE_NUM;
+
+    if (argc > 1) thread_num = std::stoul(argv[1]);
+    if (argc > 2) tuple_num = std::stoul(argv[2]);
+
+    AllResult.resize(thread_num);
+
+    size_t cc_thread_num = thread_num / 2;
+    size_t exec_thread_num = thread_num - cc_thread_num;
+
+    makeDB(tuple_num);
+    initializeTransactions(tuple_num);
+    assignRecordsToCCThreads(cc_thread_num, tuple_num);
+
+    // Debug record distribution
+    debugRecordDistribution(cc_thread_num);
 
     bool start = false;
     bool quit = false;
@@ -244,13 +324,13 @@ int main() {
     std::vector<std::thread> cc_workers, execution_workers;
 
     // Launch CC workers
-    for (size_t i = 0; i < THREAD_NUM / 2; ++i) {
+    for (size_t i = 0; i < cc_thread_num; ++i) {
         cc_workers.emplace_back(cc_worker, i, std::ref(start), std::ref(quit));
     }
 
     // Launch Execution workers
-    for (size_t i = THREAD_NUM / 2; i < THREAD_NUM; ++i) {
-        execution_workers.emplace_back(execution_worker, i, std::ref(start), std::ref(quit));
+    for (size_t i = 0; i < exec_thread_num; ++i) {
+        execution_workers.emplace_back(execution_worker, i + cc_thread_num, std::ref(start), std::ref(quit));
     }
 
     __atomic_store_n(&start, true, __ATOMIC_SEQ_CST);
